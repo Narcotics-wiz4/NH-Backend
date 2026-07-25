@@ -8,7 +8,7 @@ process.env.PAYPAL_CLIENT_ID = '';
 process.env.PAYPAL_CLIENT_SECRET = '';
 process.env.PORT = '0';
 
-const { app } = require('../index.js');
+const { app, buildBwmApiHeaders } = require('../index.js');
 const usersPath = path.join(__dirname, '..', 'users.json');
 const originalUsers = fs.existsSync(usersPath) ? fs.readFileSync(usersPath, 'utf8') : null;
 
@@ -60,6 +60,14 @@ test('config endpoint exposes current email configuration state', async () => {
   } finally {
     await stopServer(server);
   }
+});
+
+test('buildBwmApiHeaders attaches the configured key to outbound requests', () => {
+  process.env.BWM_API_KEY = 'test-key';
+  const headers = buildBwmApiHeaders();
+
+  assert.equal(headers['x-api-key'], 'test-key');
+  assert.equal(headers.Authorization, 'Bearer test-key');
 });
 
 test('signup creates a verification flow and login works after verification', async () => {

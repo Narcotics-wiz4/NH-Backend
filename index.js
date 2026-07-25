@@ -34,6 +34,14 @@ const allowedOrigins = (process.env.CORS_ALLOWED_ORIGINS || `${process.env.FRONT
   .map(origin => origin.trim())
   .filter(Boolean);
 
+function buildBwmApiHeaders() {
+  const apiKey = process.env.BWM_API_KEY || process.env.XMD_API_KEY || '';
+  return {
+    'x-api-key': apiKey,
+    Authorization: apiKey ? `Bearer ${apiKey}` : undefined,
+  };
+}
+
 const corsOptions = {
   origin(origin, callback) {
     if (!origin) return callback(null, true);
@@ -1725,4 +1733,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { app, startServer };
+module.exports = { app, startServer, buildBwmApiHeaders };
