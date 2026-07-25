@@ -71,6 +71,35 @@ const BOOKINGS_FILE = path.join(__dirname, 'bookings.json');
 const PROPERTIES_FILE = path.join(__dirname, 'properties.json');
 const ROOM_SERVICES_FILE = path.join(__dirname, 'room_services.json');
 
+function resolveMysqlConfig() {
+  const mysqlConfig = {};
+  const connectionString = process.env.DATABASE_URL || process.env.JDBC_DATABASE_URL;
+
+  if (connectionString) {
+    try {
+      const u = new URL(connectionString.replace(/^jdbc:/, ''));
+      mysqlConfig.host = u.hostname;
+      mysqlConfig.port = parseInt(u.port || '3306', 10);
+      mysqlConfig.user = decodeURIComponent(u.username || '');
+      mysqlConfig.password = decodeURIComponent(u.password || '');
+      mysqlConfig.database = (u.pathname || '').replace('/', '');
+      return mysqlConfig;
+    } catch (err) {
+      // ignore and fall back to legacy MYSQL_* variables
+    }
+  }
+
+  if (process.env.MYSQL_HOST) {
+    mysqlConfig.host = process.env.MYSQL_HOST;
+    mysqlConfig.port = parseInt(process.env.MYSQL_PORT || '3306', 10);
+    mysqlConfig.user = process.env.MYSQL_USER;
+    mysqlConfig.password = process.env.MYSQL_PASSWORD;
+    mysqlConfig.database = process.env.MYSQL_DATABASE;
+  }
+
+  return mysqlConfig;
+}
+
 // Determine DB type and create an appropriate pool (Postgres or MySQL)
 const envDbType = (process.env.DATABASE_TYPE || '').toLowerCase();
 const inferredType = process.env.DATABASE_URL && process.env.DATABASE_URL.startsWith('mysql') ? 'mysql' : 'pg';
@@ -83,36 +112,7 @@ if (dbClientType === 'pg') {
     ssl: process.env.DATABASE_SSL === 'true' ? { rejectUnauthorized: false } : undefined,
   });
 } else if (dbClientType === 'mysql') {
-  const mysqlConfig = {};
-  if (process.env.MYSQL_HOST) {
-    mysqlConfig.host = process.env.MYSQL_HOST;
-    mysqlConfig.port = parseInt(process.env.MYSQL_PORT || '3306', 10);
-    mysqlConfig.user = process.env.MYSQL_USER;
-    mysqlConfig.password = process.env.MYSQL_PASSWORD;
-    mysqlConfig.database = process.env.MYSQL_DATABASE;
-  } else if (process.env.DATABASE_URL) {
-    try {
-      const u = new URL(process.env.DATABASE_URL.replace(/^jdbc:/, ''));
-      mysqlConfig.host = u.hostname;
-      mysqlConfig.port = parseInt(u.port || '3306', 10);
-      mysqlConfig.user = decodeURIComponent(u.username || '');
-      mysqlConfig.password = decodeURIComponent(u.password || '');
-      mysqlConfig.database = (u.pathname || '').replace('/', '');
-    } catch (err) {
-      // ignore
-    }
-  } else if (process.env.JDBC_DATABASE_URL) {
-    try {
-      const u = new URL(process.env.JDBC_DATABASE_URL.replace(/^jdbc:/, ''));
-      mysqlConfig.host = u.hostname;
-      mysqlConfig.port = parseInt(u.port || '3306', 10);
-      mysqlConfig.user = decodeURIComponent(u.username || '');
-      mysqlConfig.password = decodeURIComponent(u.password || '');
-      mysqlConfig.database = (u.pathname || '').replace('/', '');
-    } catch (err) {
-      // ignore
-    }
-  }
+  const mysqlConfig = resolveMysqlConfig();
   if (Object.keys(mysqlConfig).length > 0) {
     pool = mysql.createPool(Object.assign({ waitForConnections: true, connectionLimit: 10 }, mysqlConfig));
   }
@@ -277,18 +277,23 @@ async function upsertRow(table, idColumn, idValue, payload) {
 
 async function readUsersFromFile() {
   if (!useDb) return loadJsonData(USERS_FILE);
-  let res;
-  if (dbClientType === 'pg') {
-    res = await dbQuery("SELECT payload FROM users ORDER BY payload->>'email'");
+  try {
+    let res;
+    if (dbClientType === 'pg') {
+      res = await dbQuery("SELECT payload FROM users ORDER BY payload->>'email'");
+      const rows = res.rows || res;
+      return rows.map(r => r.payload);
+    }
+    // MySQL
+    res = await dbQuery("SELECT payload FROM users ORDER BY JSON_UNQUOTE(JSON_EXTRACT(payload, '$.email'))");
     const rows = res.rows || res;
-    return rows.map(r => r.payload);
+    return rows.map(r => {
+      try { return typeof r.payload === 'string' ? JSON.parse(r.payload) : r.payload; } catch (e) { return r.payload; }
+    });
+  } catch (err) {
+    disableDbMode(err.message || err);
+    return loadJsonData(USERS_FILE);
   }
-  // MySQL
-  res = await dbQuery("SELECT payload FROM users ORDER BY JSON_UNQUOTE(JSON_EXTRACT(payload, '$.email'))");
-  const rows = res.rows || res;
-  return rows.map(r => {
-    try { return typeof r.payload === 'string' ? JSON.parse(r.payload) : r.payload; } catch (e) { return r.payload; }
-  });
 }
 
 async function saveUsersToFile(users) {
@@ -302,31 +307,51 @@ async function saveUsersToFile(users) {
     }
   }
 
-  for (const user of users) {
-    await upsertRow('users', 'email', user.email, user);
+  try {
+    for (const user of users) {
+      await upsertRow('users', 'email', user.email, user);
+    }
+  } catch (err) {
+    disableDbMode(err.message || err);
+    try {
+      fs.writeFileSync(USERS_FILE, JSON.stringify(users, null, 2), 'utf8');
+    } catch (saveErr) {
+      console.error('Unable to save users file after DB failure:', saveErr);
+      throw saveErr;
+    }
   }
 }
 
 async function readBookingsFromFile() {
   if (!useDb) return loadJsonData(BOOKINGS_FILE);
-  if (dbClientType === 'pg') {
-    const { rows } = await dbQuery("SELECT payload FROM bookings ORDER BY payload->>'id'");
-    return rows.map(row => row.payload);
+  try {
+    if (dbClientType === 'pg') {
+      const { rows } = await dbQuery("SELECT payload FROM bookings ORDER BY payload->>'id'");
+      return rows.map(row => row.payload);
+    }
+    const res = await dbQuery("SELECT payload FROM bookings ORDER BY JSON_UNQUOTE(JSON_EXTRACT(payload, '$.id'))");
+    const rows = res.rows || res;
+    return rows.map(r => { try { return typeof r.payload === 'string' ? JSON.parse(r.payload) : r.payload; } catch (e) { return r.payload; } });
+  } catch (err) {
+    disableDbMode(err.message || err);
+    return loadJsonData(BOOKINGS_FILE);
   }
-  const res = await dbQuery("SELECT payload FROM bookings ORDER BY JSON_UNQUOTE(JSON_EXTRACT(payload, '$.id'))");
-  const rows = res.rows || res;
-  return rows.map(r => { try { return typeof r.payload === 'string' ? JSON.parse(r.payload) : r.payload; } catch (e) { return r.payload; } });
 }
 
 async function readPropertiesFromFile() {
   if (!useDb) return loadJsonData(PROPERTIES_FILE);
-  if (dbClientType === 'pg') {
-    const { rows } = await dbQuery("SELECT payload FROM properties ORDER BY payload->>'id'");
-    return rows.map(row => row.payload);
+  try {
+    if (dbClientType === 'pg') {
+      const { rows } = await dbQuery("SELECT payload FROM properties ORDER BY payload->>'id'");
+      return rows.map(row => row.payload);
+    }
+    const res = await dbQuery("SELECT payload FROM properties ORDER BY JSON_UNQUOTE(JSON_EXTRACT(payload, '$.id'))");
+    const rows = res.rows || res;
+    return rows.map(r => { try { return typeof r.payload === 'string' ? JSON.parse(r.payload) : r.payload; } catch (e) { return r.payload; } });
+  } catch (err) {
+    disableDbMode(err.message || err);
+    return loadJsonData(PROPERTIES_FILE);
   }
-  const res = await dbQuery("SELECT payload FROM properties ORDER BY JSON_UNQUOTE(JSON_EXTRACT(payload, '$.id'))");
-  const rows = res.rows || res;
-  return rows.map(r => { try { return typeof r.payload === 'string' ? JSON.parse(r.payload) : r.payload; } catch (e) { return r.payload; } });
 }
 
 async function savePropertiesToFile(properties) {
@@ -340,8 +365,18 @@ async function savePropertiesToFile(properties) {
     }
   }
 
-  for (const property of properties) {
-    await upsertRow('properties', 'id', String(property.id), property);
+  try {
+    for (const property of properties) {
+      await upsertRow('properties', 'id', String(property.id), property);
+    }
+  } catch (err) {
+    disableDbMode(err.message || err);
+    try {
+      fs.writeFileSync(PROPERTIES_FILE, JSON.stringify(properties, null, 2), 'utf8');
+    } catch (saveErr) {
+      console.error('Unable to save properties file after DB failure:', saveErr);
+      throw saveErr;
+    }
   }
 }
 
@@ -356,24 +391,39 @@ async function saveBookingsToFile(bookings) {
     }
   }
 
-  for (const booking of bookings) {
-    if (dbClientType === 'pg') {
-      await dbQuery('INSERT INTO bookings(id,user_email,payload) VALUES($1,$2,$3) ON CONFLICT (id) DO UPDATE SET payload = EXCLUDED.payload', [String(booking.id), booking.userEmail || null, booking]);
-    } else {
-      await dbQuery('INSERT INTO bookings(id,user_email,payload) VALUES($1,$2,$3) ON DUPLICATE KEY UPDATE payload = VALUES(payload)', [String(booking.id), booking.userEmail || null, booking]);
+  try {
+    for (const booking of bookings) {
+      if (dbClientType === 'pg') {
+        await dbQuery('INSERT INTO bookings(id,user_email,payload) VALUES($1,$2,$3) ON CONFLICT (id) DO UPDATE SET payload = EXCLUDED.payload', [String(booking.id), booking.userEmail || null, booking]);
+      } else {
+        await dbQuery('INSERT INTO bookings(id,user_email,payload) VALUES($1,$2,$3) ON DUPLICATE KEY UPDATE payload = VALUES(payload)', [String(booking.id), booking.userEmail || null, booking]);
+      }
+    }
+  } catch (err) {
+    disableDbMode(err.message || err);
+    try {
+      fs.writeFileSync(BOOKINGS_FILE, JSON.stringify(bookings, null, 2), 'utf8');
+    } catch (saveErr) {
+      console.error('Unable to save bookings file after DB failure:', saveErr);
+      throw saveErr;
     }
   }
 }
 
 async function readRoomServicesFromFile() {
   if (!useDb) return loadJsonData(ROOM_SERVICES_FILE);
-  if (dbClientType === 'pg') {
-    const { rows } = await dbQuery("SELECT payload FROM room_services ORDER BY payload->>'id'");
-    return rows.map(row => row.payload);
+  try {
+    if (dbClientType === 'pg') {
+      const { rows } = await dbQuery("SELECT payload FROM room_services ORDER BY payload->>'id'");
+      return rows.map(row => row.payload);
+    }
+    const res = await dbQuery("SELECT payload FROM room_services ORDER BY JSON_UNQUOTE(JSON_EXTRACT(payload, '$.id'))");
+    const rows = res.rows || res;
+    return rows.map(r => { try { return typeof r.payload === 'string' ? JSON.parse(r.payload) : r.payload; } catch (e) { return r.payload; } });
+  } catch (err) {
+    disableDbMode(err.message || err);
+    return loadJsonData(ROOM_SERVICES_FILE);
   }
-  const res = await dbQuery("SELECT payload FROM room_services ORDER BY JSON_UNQUOTE(JSON_EXTRACT(payload, '$.id'))");
-  const rows = res.rows || res;
-  return rows.map(r => { try { return typeof r.payload === 'string' ? JSON.parse(r.payload) : r.payload; } catch (e) { return r.payload; } });
 }
 
 async function saveRoomServicesToFile(services) {
@@ -387,11 +437,21 @@ async function saveRoomServicesToFile(services) {
     }
   }
 
-  for (const service of services) {
-    if (dbClientType === 'pg') {
-      await dbQuery('INSERT INTO room_services(id,booking_id,user_email,payload) VALUES($1,$2,$3,$4) ON CONFLICT (id) DO UPDATE SET payload = EXCLUDED.payload', [String(service.id), service.bookingId || null, service.userEmail || null, service]);
-    } else {
-      await dbQuery('INSERT INTO room_services(id,booking_id,user_email,payload) VALUES($1,$2,$3,$4) ON DUPLICATE KEY UPDATE payload = VALUES(payload)', [String(service.id), service.bookingId || null, service.userEmail || null, service]);
+  try {
+    for (const service of services) {
+      if (dbClientType === 'pg') {
+        await dbQuery('INSERT INTO room_services(id,booking_id,user_email,payload) VALUES($1,$2,$3,$4) ON CONFLICT (id) DO UPDATE SET payload = EXCLUDED.payload', [String(service.id), service.bookingId || null, service.userEmail || null, service]);
+      } else {
+        await dbQuery('INSERT INTO room_services(id,booking_id,user_email,payload) VALUES($1,$2,$3,$4) ON DUPLICATE KEY UPDATE payload = VALUES(payload)', [String(service.id), service.bookingId || null, service.userEmail || null, service]);
+      }
+    }
+  } catch (err) {
+    disableDbMode(err.message || err);
+    try {
+      fs.writeFileSync(ROOM_SERVICES_FILE, JSON.stringify(services, null, 2), 'utf8');
+    } catch (saveErr) {
+      console.error('Unable to save room services file after DB failure:', saveErr);
+      throw saveErr;
     }
   }
 }
@@ -1733,4 +1793,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { app, startServer, buildBwmApiHeaders };
+module.exports = { app, startServer, buildBwmApiHeaders, resolveMysqlConfig };

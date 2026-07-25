@@ -8,7 +8,7 @@ process.env.PAYPAL_CLIENT_ID = '';
 process.env.PAYPAL_CLIENT_SECRET = '';
 process.env.PORT = '0';
 
-const { app, buildBwmApiHeaders } = require('../index.js');
+const { app, buildBwmApiHeaders, resolveMysqlConfig } = require('../index.js');
 const usersPath = path.join(__dirname, '..', 'users.json');
 const originalUsers = fs.existsSync(usersPath) ? fs.readFileSync(usersPath, 'utf8') : null;
 
@@ -68,6 +68,24 @@ test('buildBwmApiHeaders attaches the configured key to outbound requests', () =
 
   assert.equal(headers['x-api-key'], 'test-key');
   assert.equal(headers.Authorization, 'Bearer test-key');
+});
+
+test('resolveMysqlConfig prefers DATABASE_URL over legacy MYSQL_* settings', () => {
+  process.env.DATABASE_URL = 'mysql://user:pass@127.0.0.1:3307/testdb';
+  process.env.JDBC_DATABASE_URL = '';
+  process.env.MYSQL_HOST = '172.18.0.1';
+  process.env.MYSQL_PORT = '3306';
+  process.env.MYSQL_USER = 'legacy';
+  process.env.MYSQL_PASSWORD = 'legacy-pass';
+  process.env.MYSQL_DATABASE = 'legacydb';
+
+  const config = resolveMysqlConfig();
+
+  assert.equal(config.host, '127.0.0.1');
+  assert.equal(config.port, 3307);
+  assert.equal(config.user, 'user');
+  assert.equal(config.password, 'pass');
+  assert.equal(config.database, 'testdb');
 });
 
 test('signup creates a verification flow and login works after verification', async () => {
